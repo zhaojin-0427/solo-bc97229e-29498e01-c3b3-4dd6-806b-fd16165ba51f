@@ -8,13 +8,16 @@ services:
     environment:
       SOURCE_DB: /data/source/specimens.db
       REPLICA_DB: /data/replica/specimens_replica.db
+      CHECK_DB: /data/check/consistency_check.db
       POLL_INTERVAL: "1.0"
       AUTO_START: "1"
       SNAPSHOT_PAGE_SIZE: "500"
       CHANGE_BATCH_SIZE: "500"
+      CHECK_BATCH_SIZE: "500"
     volumes:
       - source_data:/data/source
       - replica_data:/data/replica
+      - check_data:/data/check
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz').status==200 else 1)"]
       interval: 10s
@@ -41,3 +44,4 @@ services:
 volumes:
   source_data:
   replica_data:
+  check_data:

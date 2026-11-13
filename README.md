@@ -4,6 +4,9 @@
 查询；鉴定员仍直接在源库登记、更正、撤回。提供 Flask 网页启动/停止同步、查看
 进度与错误、按标本号查询副本，并附带可持续修改的示例源库。
 
+另附**后台一致性核对**：分布研究取数前，确认副本是否漏录、误留或改坏标本。
+核对在独立网页发起，只读源库与副本，结论写入第三个独立核对库。
+
 ## 需求与实现对照
 
 | 需求 | 实现方式 |
@@ -20,6 +23,54 @@
 | 就绪后重启按持久进度接续 | 只要 `last_applied_seq > 0`，无论上次 RUNNING/STOPPED/ERROR，都从该序号续跑，不重做快照 |
 | 源为本地 SQLite WAL | 源库 `PRAGMA journal_mode=WAL`；副本为独立 SQLite 文件，独立挂载卷 |
 | 允许增加辅助表及触发器 | 源库增加 `_change_log` 表与 3 个触发器；副本增加 `sync_meta`、`_applied_changes` |
+| 一致性核对 | 见下节「后台一致性核对」 |
+
+## 后台一致性核对
+
+分布研究取数前，在 `/check` 页面发起一次核对，确认副本是否**漏录**、
+**误留**或**改坏**标本。核对在后台线程分批执行，网页实时展示进度。
+
+### 工作流程
+
+```
+PIN_REPLICA  固定副本截面：只读快照（query_only）读出副本已应用序号 R
+             与全部 specimens，分页誊写到核对库 staged_replica
+PIN_SOURCE   固定源库同一读取快照：水位 W = MAX(_change_log.seq)、
+             日志切片 (R, W]、全部 specimens，分页誊写到核对库
+CATCH_UP     把日志切片按 seq 升序重放到副本截面，补齐到源水位
+             —— 正常同步延迟（R < W）在此被消化，不算差异
+COMPARE      以源快照为准逐 id 比较 taxon / locality：
+             源有副本无 = 缺失；副本有源无 = 多余；字段不同 = 改坏
+DONE         同一事务发布报告并清理中间截面
+```
+
+### 保证
+
+| 需求 | 实现方式 |
+| --- | --- |
+| 仅接收已就绪副本 | 受理时与取截面时两次校验副本 `phase == RUNNING`，否则拒绝（409） |
+| 固定两端截面 | 副本、源库各自在同一个只读快照内完成誊写；两端水位（R、W）随报告标明 |
+| 正常同步延迟不算差异 | 副本截面先按源日志切片 (R, W] 补齐，再与源快照逐 id 比较 |
+| 不改写源库及运行中的副本 | 源库 `mode=ro`、副本 `query_only=ON` 只读连接；结论写入第三个独立核对库 |
+| 源写入/原同步/查询继续可用 | 全程只持**读**事务（WAL 读写并发），核对库写事务按批提交、随提随放，绝不持写事务等待核对完成 |
+| 内存不随总量增长 | 誊写、补齐、比较全部 keyset 分批（`CHECK_BATCH_SIZE`），每批一个短事务 |
+| 失败不发布部分结论 | 差异仅 `DONE` 状态可查询；失败即清理该次的差异与中间截面 |
+| 重启保留完整报告 | 报告与差异持久化在核对库；启动时将未完成核对待为 FAILED 并清除其部分结论 |
+
+### 演示
+
+```bash
+docker compose up -d --build
+# 打开 http://localhost:8000/check
+```
+
+1. 点击「开始核对」——健康副本应报告 0 差异；
+2. 点击「注入漏录 / 误留 / 改坏」（演示按钮直接改写副本，真实系统中副本只由
+   同步器写入），再次核对，报告中分页列出差异标本及双方值；
+3. 在控制台页停止同步、对源库写入、恢复同步后立即核对——副本落后部分被
+   补齐，不产生差异（两端水位如实标明）。
+
+核对结论持久化在独立命名卷 `check_data`，重启容器后已完成报告完整保留。
 
 ## 架构
 
@@ -61,12 +112,14 @@ app/
   source_db.py     源库：WAL、specimens、CDC 表与触发器、演示写入 API
   replica_db.py    副本：表结构、持久进度 meta、就绪判定、查询
   sync.py          同步引擎：bootstrap + 增量循环，后台线程生命周期
+  check.py         一致性核对：固定截面、补齐、逐 id 比较、报告持久化
   web.py           Flask 应用与 REST API
   templates/index.html  控制台页面
+  templates/check.html  一致性核对页面
 scripts/
   seed_source.py   播种示例源库（容器入口调用）
   demo_mutator.py  持续演示写入器（周期增/改/撤）
-tests/             27 个 pytest 测试（CDC 正确性、并发、崩溃、续跑、Web E2E）
+tests/             43 个 pytest 测试（CDC 正确性、并发、崩溃、续跑、核对、Web E2E）
 Dockerfile, docker-compose.yml, entrypoint.sh, wsgi.py
 ```
 
@@ -84,7 +137,8 @@ docker compose up -d --build
 
 * 查看同步阶段（INIT/BOOTSTRAP/RUNNING/STOPPED/ERROR）、已应用序号、源端水位、错误；
 * 启动/停止同步；按标本号查询副本（未就绪时返回 503）；
-* 在页面上直接对**源库**新增 / 更正 / 撤回，观察副本自动追上。
+* 在页面上直接对**源库**新增 / 更正 / 撤回，观察副本自动追上；
+* 打开 `/check` 发起后台一致性核对，查看进度、两端水位与分页差异报告。
 
 附带一个持续写入器，模拟鉴定员不停操作（可选 profile，不影响主服务）：
 
@@ -93,9 +147,9 @@ docker compose --profile mutator up -d
 docker compose logs -f mutator
 ```
 
-数据持久化在两个独立命名卷 `source_data`、`replica_data`。删除容器再
-`docker compose up -d` 会自动按副本里的持久进度接续；清空 `replica_data` 卷
-则会重新做首次复制。
+数据持久化在三个独立命名卷 `source_data`、`replica_data`、`check_data`。删除容器再
+`docker compose up -d` 会自动按副本里的持久进度接续，已完成核对报告也完整保留；
+清空 `replica_data` 卷则会重新做首次复制。
 
 ## 本地（无 Docker）运行
 
@@ -103,6 +157,7 @@ docker compose logs -f mutator
 pip install -r requirements.txt
 export SOURCE_DB=./data/source/specimens.db
 export REPLICA_DB=./data/replica/specimens_replica.db
+export CHECK_DB=./data/check/consistency_check.db
 python -m scripts.seed_source          # 播种示例源库（可选，Web 启动也会自动播种）
 python -m flask --app wsgi:app run --port 8000
 # 或：gunicorn --bind 0.0.0.0:8000 --workers 1 --threads 8 wsgi:app
@@ -120,6 +175,12 @@ python -m flask --app wsgi:app run --port 8000
 | `POST /api/demo/update` | 对源库更正 `{id,taxon,locality}` |
 | `POST /api/demo/delete` | 撤回源记录 `{id}` |
 | `GET  /api/source/specimens` | 源库当前标本（演示辅助） |
+| `GET  /check` | 一致性核对页面（进度、差异报告、历史） |
+| `POST /api/check/start` | 受理一次核对；副本未就绪或已有核对进行中返回 409 |
+| `GET  /api/check/runs` | 最近核对列表（状态、两端水位、差异计数） |
+| `GET  /api/check/runs/<id>` | 单次核对详情（进度 / 报告） |
+| `GET  /api/check/runs/<id>/diffs` | 分页差异（`category`/`offset`/`limit`）；仅 DONE 发布，否则 409 |
+| `POST /api/demo/tamper_replica` | 演示：直接改写副本（`op=delete/insert/update`），供核对发现差异 |
 | `GET  /healthz` | 健康检查 |
 
 ## 测试
@@ -132,7 +193,9 @@ pytest tests/ -v
 覆盖要点：触发器捕获全部 DML、回滚不传播、已提交序号单调、单事务多行原子可见、
 首次复制期间并发增删改的最终一致性、删除不复活、旧值不覆盖新值、中断重做、
 重启按持久进度接续且不重做快照、提交点崩溃后数据与进度均不半生效、增量走索引
-不全表扫描、同步期间源写入不被阻塞、就绪前 503、Web 端到端增改撤链路。
+不全表扫描、同步期间源写入不被阻塞、就绪前 503、Web 端到端增改撤链路；
+一致性核对的截面一致性、同步延迟补齐、三类差异识别、只读不干扰源/副本/原同步、
+失败不发布部分结论、重启保留报告并标记中断为失败、核对 Web API 全流程。
 
 ## 关键环境变量
 
@@ -140,8 +203,10 @@ pytest tests/ -v
 | --- | --- | --- |
 | `SOURCE_DB` | `/data/source/specimens.db` | 源库文件路径 |
 | `REPLICA_DB` | `/data/replica/specimens_replica.db` | 副本文件路径 |
+| `CHECK_DB` | `/data/check/consistency_check.db` | 核对库文件路径（独立第三库） |
 | `AUTO_START` | `1` | 容器/应用启动时是否自动开始同步 |
 | `POLL_INTERVAL` | `1.0` | 无新变更时的轮询秒数（stop 可立即唤醒） |
 | `SNAPSHOT_PAGE_SIZE` | `500` | 首次复制快照每页行数 |
 | `CHANGE_BATCH_SIZE` | `500` | 增量每批应用的日志条数 |
+| `CHECK_BATCH_SIZE` | `500` | 核对誊写/补齐/比较的批大小 |
 | `MUTATOR_INTERVAL` | `3` | 演示写入器操作间隔秒数 |

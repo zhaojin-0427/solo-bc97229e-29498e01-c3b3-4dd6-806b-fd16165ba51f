@@ -7,6 +7,7 @@ import pytest
 # 必须在导入 app.web 前指向临时目录，避免模块级 app 使用默认 /data 路径
 os.environ.setdefault("SOURCE_DB", "/tmp/museum-test-webdb/source.db")
 os.environ.setdefault("REPLICA_DB", "/tmp/museum-test-webdb/replica.db")
+os.environ.setdefault("CHECK_DB", "/tmp/museum-test-webdb/check.db")
 
 from app import replica_db, source_db  # noqa: E402
 from app.web import create_app  # noqa: E402
